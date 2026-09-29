@@ -1,0 +1,7 @@
+gym[Box2D]
+torch
+JSAnimation
+matplotlib
+ray
+tqdm
+numpy
