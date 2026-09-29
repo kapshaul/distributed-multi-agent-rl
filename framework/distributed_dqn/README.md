@@ -1,70 +1,127 @@
 # Distributed Deep Q-Learning
-The goal of this project is to implement and experiment with both single-core and distributed versions of the deep reinforcement learning algorithm Deep Q Networks (DQN).
-In particular, DQN will be run in the classic RL benchmark Cart-Pole and abblation experiments will be run to observe the impact of the different DQN components.
 
-Back to the [repository overview](../../README.md). The accompanying notebook is [distributed_dqn.ipynb](distributed_dqn.ipynb).
+This directory implements Deep Q-Networks (DQN) on CartPole. It has two parts:
 
-## DQN Overview
-DQN is simply the standard table-based Q-learning algorithm but with three extensions:
-1) Use of function approximation via a neural network instead of a Q-table.
-2) Use of experience replay.
-3) Use of a target network.
+- an archived notebook containing a **single-process** DQN with recorded outputs;
+- a **Ray-based** script that splits experience collection, learning, and evaluation across workers.
 
-Extension (1) allows for scaling to problems with enormous state spaces, such as when the states correspond to images or sequences of images. Extensions (2) and (3) are claimed to improve the robustness and effectiveness of DQN compared.
+The work began as an Oregon State University CS533 course project. The [project page](https://kapshaul.github.io/projects/distributed-agents/) has more background.
 
-(2) adjusts Q-learning so that updates are not just performed on individual experiences as they arrive. But rather, experiences are stored in a memory buffer and updates are performed by sampling random mini-batches of experience tuples from the memory buffer and updating the network based on the mini-batch. This allows for reuse of experience as well as helping to reduce correlation between successive updates, which is claimed to be beneficial.
+Back to the [repository overview](../../README.md). This directory is separate from the PPO code in [`../ppo/`](../ppo/) and does not use the root `main.py` or the root `requirements.txt`.
 
-(3) adjusts the way that target values are computed for the Q-learning updates. Let $Q_{\\theta}(s,a)$ be the function approximation network with parameters $\\theta$ for representing the Q-function. Given an experience tuple $(s, a, r, s')$ the origional Q-learning algorithm updates the parameters so that $Q_{\\theta}(s,a)$ moves closer to the target value:
+> **Status:** `distributed_dqn.py` is a prototype entry point. It has not been shown to complete a run in its current form. The [known blockers](#known-blockers-in-distributed_dqnpy) must be addressed before it can train and evaluate end to end. This directory contains no result files, learning curves, or timing measurements from the distributed script.
+
+## DQN in brief
+
+DQN extends Q-learning in three ways:
+
+1. **Function approximation.** A neural network $Q_\theta(s, a)$ replaces the Q-table.
+2. **Experience replay.** Transitions $(s, a, r, s', d)$ are stored in a buffer, and updates use random minibatches sampled from it. This reuses experience and weakens the correlation between consecutive updates.
+3. **A target network.** A second network with parameters $\theta^-$ supplies the bootstrap value and is periodically overwritten with the online parameters, $\theta^- \leftarrow \theta$.
+
+For a sampled transition, the code regresses $Q_\theta(s, a)$ toward
 
 $$
-r + \\beta \\max_a' Q_{\\theta}(s',a')
+y =
+\begin{cases}
+r, & \text{if } s' \text{ is terminal},\\
+r + \beta \max_{a'} Q_{\theta^-}(s', a'), & \text{otherwise,}
+\end{cases}
 $$
 
-Rather, DQN stores two function approximation networks. The first is the update network with parameters $\\theta$, which is the network that is continually updated during learning. The second is a target network with parameters $\\theta'$. Given the same experience tuple, DQN will update the parameters $\\theta$ so that $Q_{\\theta}(s,a)$ moves toward a target value based on the target network:
+where $\beta$ is the discount factor (`beta = 0.99` in the code). The loss is `SmoothL1Loss` (Huber), optimized with Adam. When `use_target_model` is `False`, the target computation is written to use the online network $Q_\theta$ in place of $Q_{\theta^-}$. The full no-target configuration still fails, however, because `learn` accesses `self.target_model` unconditionally (see [known blockers](#known-blockers-in-distributed_dqnpy)), so it is not a working ablation.
 
-$$
-r + \\beta \\max_a' Q_{\\theta'}(s',a')
-$$
+Episodes that reach the 200-step cap without the pole falling are *not* flagged as terminal. For those transitions the target still bootstraps from $s'$.
 
-Periodically the target network is updated with the most recent parameters $\\theta' \\leftarrow \\theta$. This use of a target network is claimed to stabilize learning.
-
-## Distributed DQN agent
-
-The idea is to speedup learning by creating actors to collect data and a model server to update the neural network model.
-- Collector: There is a simulator inside each collector. Their job is to collect exprience from the simulator, and send them to the memory server. They follow the explore_or_exploit policy, getting greedy action from model server. Also, call update function of model server to update the model.
-- Evaluator: There is a simulator inside the evaluator. It is called by the the Model Server, taking eval_model from it, and test its performance.
-- Model Server: Stores the evalation and target networks. It Takes experiences from Memory Server and updates the Q-network, also replacing target Q-network periodically. It also interfaces to the evaluator periodically.
-- Memory Server: It is used to store/sample experience relays.
-
-An image of this architecture is below.
+## Architecture of `distributed_dqn.py`
 
 <img src="architecture.png" alt="Distributed DQN architecture with collectors, evaluator, model server, and memory server" width="800">
 
-For this part, using ```custom_cartpole.py``` as an enviroment. This version of cartpole is slower, which allows for the benefits of distributed experience collection to be observed. In particular, the time to generate an experience tuple needs to be non-trivial compared to the time needed to do a neural network model update.
+| Component | Ray construct | What the code does |
+| --- | --- | --- |
+| **Model server** | `@ray.remote` actor `model_server` | Holds the online network (`eval_model`) and the target network. Chooses every action on behalf of the collectors (`explore_or_exploit_policy`, with ε decaying linearly from 1 to `final_epsilon`). When a collector reports a finished episode of *n* steps, `learn(n)` advances the server's step counter *n* times. It samples a minibatch and updates the online network every `update_steps` steps, and copies the online weights into the target network every `model_replace_freq` steps. It also hands out evaluation work and saves the best model. |
+| **Memory server** | `@ray.remote` actor `ReplayBuffer_remote` | A FIFO ring buffer of 2000 transitions (hard-coded in `distributed_DQN_agent`). Minibatches are sampled uniformly with replacement. |
+| **Collectors** (default 4) | `@ray.remote` task `collecting_worker` | Each collector runs its own CartPole copy. For every step it asks the model server for an action, then pushes the transition to the memory server. At the end of each episode it calls `learn` and stops once `learn` returns `True`. |
+| **Evaluators** (default 4) | `@ray.remote` task `evaluation_worker` | Each evaluator polls `ask_evaluation`. When given a checkpoint index, it runs 30 greedy episodes and writes the average return. |
 
----
+Two consequences of this design:
 
-## Installation
+- **Learning happens in bursts at episode boundaries.** All gradient updates run on the model-server actor.
+- **Every environment step waits on a remote call to the server.** The distributed version helps only when stepping the environment is slow relative to that round trip. For this reason the script uses [`custom_cartpole.py`](custom_cartpole.py), a standard CartPole with `time.sleep(0.01)` added to every step.
 
-1. Clone the repository:
+## Files
 
-    ```bash
-    git clone https://github.com/kapshaul/distributed-multi-agent-rl.git
-    cd distributed-multi-agent-rl/framework/distributed_dqn
-    ```
+| File | Role |
+| --- | --- |
+| [`distributed_dqn.py`](distributed_dqn.py) | Ray script: model server, collectors, evaluators, `distributed_DQN_agent`, and `main()` |
+| [`dqn_model.py`](dqn_model.py) | `_DQNModel`: MLP with layers 4 → 256 → 64 → 2, tanh activations, and Xavier initialization. `DQNModel` wraps it in `nn.DataParallel` and provides `predict`, `predict_batch`, `fit` (Huber loss + Adam), `replace`, `save`, and `load`. |
+| [`memory_remote.py`](memory_remote.py) | Ray-actor replay buffer used by the script |
+| [`memory.py`](memory.py) | Local replay buffer used by the notebook's single-process agent |
+| [`custom_cartpole.py`](custom_cartpole.py) | Classic CartPole with a 10 ms sleep per step, a 200-step cap (`_max_episode_steps`), and the old Gym `step()` signature returning 4 values |
+| [`distributed_dqn.ipynb`](distributed_dqn.ipynb) | Archived course notebook (see below) |
+| [`requirements.txt`](requirements.txt) | Unpinned dependency list for this directory |
+| [`architecture.png`](architecture.png) | Architecture diagram |
 
-2. Install the required Python packages:
+## Default settings in the script
 
-    ```
-    pip install -r requirements.txt
-    ```
+| Setting | Value | Where it is set |
+| --- | --- | --- |
+| Training episodes / evaluation interval | 10,000 / every 50 episodes | `main()` |
+| Evaluation trials per checkpoint | 30 | `main()` |
+| Collectors / evaluators | 4 / 4 | `distributed_DQN_agent.__init__` defaults |
+| ε schedule | 1 → 0.1, linear over 100,000 server steps | `hyperparams_CartPole` |
+| Minibatch size / update period | 32 / every 10 steps | `hyperparams_CartPole` |
+| Target replacement period | every 2000 steps | `hyperparams_CartPole` |
+| Replay capacity | 2000 | Hard-coded in `ReplayBuffer_remote.remote(2000)`. The `memory_size` hyperparameter is not read. |
+| Discount β / learning rate | 0.99 / 3e-4 | `hyperparams_CartPole` |
+| Ray init | `include_webui=False, redis_max_memory=5e8, object_store_memory=5e9` | Module level |
 
-## Implementation
+The model server always receives the module-level `hyperparams_CartPole` dictionary, whatever is passed to `distributed_DQN_agent`. The `update_steps` and `model_replace_freq` locals inside `collecting_worker` are never used.
 
-1. **Set Up the Environment**
+## The archived notebook and the script
 
-   The code is designed to work with a custom CartPole environment. Make sure that the `custom_cartpole.py` and the necessary model and memory files (`dqn_model.py`, `memory_remote.py`) are properly configured and located in the repository.
+[`distributed_dqn.ipynb`](distributed_dqn.ipynb) is the course notebook.
 
-2. **Execute the Distributed DQN Python Script**
+- **Part 1** runs a *single-process* `DQN_agent` on `gym.make('CartPole-v0')` with the local `ReplayBuffer`. It uses the same hyperparameters and trains for 10,000 episodes, evaluating every 50. The notebook metadata records Python 3.7.11, and saved `pip` output shows `gym` 0.21.0 and `torch` 1.10.0. The notebook stores 405 cell outputs, 402 of them in cell 20. Part 1 also lists the replay/target ablations that the course assignment requested.
+- **Part 2** only initializes Ray and describes the distributed design. It notes that the distributed agent was meant to run as a standalone script on a compute node, and the notebook contains no distributed implementation.
 
-   To start training the Distributed DQN on the CartPole environment, run `python distributed_dqn.py`.
+The distributed implementation exists only in `distributed_dqn.py`. Results in the notebook come from the single-process agent and do not measure the Ray version.
+
+## Running the script (conditional)
+
+The intended invocation is shown below. The bare imports of sibling modules (`from dqn_model import ...`) resolve from any working directory, because Python puts the script's directory on `sys.path`. The output paths, however, are relative to the working directory, so run it from this directory to keep them here:
+
+```bash
+cd framework/distributed_dqn
+pip install -r requirements.txt   # unpinned; see the dependency notes below
+python distributed_dqn.py
+```
+
+These commands will not complete a training run until the blockers below are resolved. When the script does run, it writes the following paths relative to the working directory (this directory in the commands above):
+
+- `CartPole-v0/` is created at import time.
+- `CartPole-v0/result_file_1.txt` receives one average evaluation return per line, followed by the total wall-clock time.
+- `CartPole-v0/best_model.pt` holds the best-scoring online network.
+- `reward_4cv_4ev.png` is the learning curve, plotted against the episode index.
+
+## Known blockers in `distributed_dqn.py`
+
+- **Undefined `training_episodes` in `model_server.learn`.** The method compares `self.episode` against a module-level name `training_episodes`. That name exists only as a local inside `main()`, so the first `learn` call raises `NameError`. The failure reaches each collector through `ray.get`, and the collectors stop. The evaluators wait until `self.episode >= self.training_episodes`, which then never happens, so they can poll indefinitely and `ray.wait` never returns. Reading `self.training_episodes` would match the rest of the class.
+- **Historical Ray arguments.** `ray.init(include_webui=..., redis_max_memory=...)` uses keyword arguments from early Ray releases that later versions reject. `requirements.txt` does not pin Ray.
+- **`use_target_model=False` still accesses the target network.** `learn` calls `self.target_model.replace(...)` unconditionally, but `target_model` is created only when `use_target_model` is `True`. The no-target ablation therefore fails with `AttributeError`.
+- **Evaluator skips checkpoint 0 and evaluates the live network.** `evaluation_worker` tests `if not num`, which treats index 0 like "no work", so `results[0]` is never filled and stays 0. `privous_q_net` stores references to the same `eval_model` object rather than copies. Evaluators also call `server.greedy_policy`, which uses the *current* network. Each reported value is therefore the performance of the network at evaluation time, not a frozen snapshot from the corresponding 50-episode boundary.
+- **Missing and extra dependencies.** The script imports `IPython.display.HTML`, but `IPython` is not in `requirements.txt`. The script does not use `JSAnimation` or the `Box2D` extra of `gym`, although the requirements file lists them.
+- **NumPy 2 incompatibility in the replay buffer.** `memory_remote.py` builds arrays with `np.array(action, copy=False)` from Python integers. Under NumPy 2 this raises `ValueError` because a copy is required, and the unpinned `numpy` requirement does not rule NumPy 2 out.
+- **Old Gym API.** `custom_cartpole.py` subclasses `gym.Env` and returns 4-tuple steps. The script expects that interface rather than the Gymnasium 5-tuple interface.
+
+## Dependency notes
+
+This directory's [`requirements.txt`](requirements.txt) lists `gym[Box2D]`, `torch`, `JSAnimation`, `matplotlib`, `ray`, `tqdm`, and `numpy`, with no versions pinned. It is separate from the repository-root `requirements.txt`, which is a UTF-16 CUDA 12.8 snapshot for PPO that does not include Ray or Gym.
+
+A working environment needs:
+
+- `IPython`;
+- a Ray version that accepts the `ray.init` arguments above, or an edited call;
+- a NumPy version compatible with `copy=False`, or an edited buffer.
+
+The notebook metadata and saved outputs point to Python 3.7.11, gym 0.21.0, and torch 1.10.0 as the original environment, but they do not record the original Ray version.
